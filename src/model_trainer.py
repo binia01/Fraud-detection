@@ -2,8 +2,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import os
+import joblib 
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, RandomizedSearchCV
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, average_precision_score, confusion_matrix, classification_report,
@@ -26,14 +28,15 @@ class ModelTrainer:
     def split_data(self, test_size=0.2, random_state=42):
         '''Split data into training and test sets using Stratified Split'''
         print(f"Splitting data (Test size: {test_size})....")
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size= test_size, random_state=random_state, stratify=self.y)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+            self.X, self.y, test_size=test_size, random_state=random_state, stratify=self.y
+        )
         print(f"Train Shape: {self.X_train.shape}, Test Shape: {self.X_test.shape}")
 
-    
     def train_with_cv(self, model, model_name, k=5):
         """
         Trains model using Stratified K-Fold CV with SMOTE inside the pipeline.
-        This prevents data leakage where synthetic test data is seen during training.
+        Used for Baseline models.
         """
         print(f"\n--- Training {model_name} with Stratified K-Fold (k={k}) ---")
 
@@ -48,21 +51,82 @@ class ModelTrainer:
 
         print(f"Mean F1-Score (CV): {f1_scores.mean():.4f} (+/- {f1_scores.std():.4f})")
         
-        # Fit on the full training set for final evaluation
+        # Fit on the full training set for final evaluation and saving
         pipeline.fit(self.X_train, self.y_train)
         self.models[model_name] = pipeline
         
         return pipeline
-    
+
+    def hyperparameter_tuning(self, model, model_name, param_dist, n_iter=10, k=5, scoring='average_precision'):
+        """
+        Performs Randomized Search CV to find the best hyperparameters.
+        Includes SMOTE in the pipeline to prevent data leakage.
+        """
+        print(f"\n--- Tuning Hyperparameters for {model_name} ---")
+
+        # 1. Create the pipeline (SMOTE + Model)
+        pipeline = ImbPipeline(steps=[
+            ('smote', SMOTE(random_state=42)),
+            ('model', model)
+        ])
+
+        # 2. Adjust parameter keys for the pipeline
+        pipeline_params = {f'model__{key}': value for key, value in param_dist.items()}
+
+        # 3. Setup Cross-Validation
+        cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
+
+        # 4. Setup Randomized Search
+        search = RandomizedSearchCV(
+            estimator=pipeline,
+            param_distributions=pipeline_params,
+            n_iter=n_iter,
+            scoring=scoring,
+            cv=cv,
+            verbose=1,
+            random_state=42,
+            n_jobs=1
+        )
+
+        # 5. Fit
+        search.fit(self.X_train, self.y_train)
+
+        print(f"Best Parameters: {search.best_params_}")
+        print(f"Best CV Score ({scoring}): {search.best_score_:.4f}")
+
+        # 6. Store the best model
+        # Crucial: This ensures the model is stored by NAME so save_model can find it later
+        self.models[model_name] = search.best_estimator_
+
+        return search.best_estimator_
+
     def evaluate_model(self, model_name):
+        """
+        Evaluates the model on the test set. 
+        Includes robust probability handling.
+        """
         if model_name not in self.models:
             print(f"Error: {model_name} not trained yet.")
+            return
 
         model = self.models[model_name]
 
-         # Predictions
+        # Predictions
         y_pred = model.predict(self.X_test)
-        y_prob = model.predict_proba(self.X_test)[:, 1] if hasattr(model.named_steps['model'], "predict_proba") else y_pred
+        
+        # Robust Probability Handling (Updated)
+        y_prob = None
+        try:
+            # Try getting probabilities
+            if hasattr(model, "predict_proba"):
+                y_prob = model.predict_proba(self.X_test)[:, 1]
+            elif hasattr(model, "named_steps") and hasattr(model.named_steps['model'], "predict_proba"):
+                y_prob = model.predict_proba(self.X_test)[:, 1]
+            else:
+                y_prob = y_pred # Fallback
+        except Exception as e:
+            print(f"Warning: Could not calculate probabilities for {model_name}: {e}")
+            y_prob = y_pred
 
         # Metrics
         acc = accuracy_score(self.y_test, y_pred)
@@ -70,7 +134,7 @@ class ModelTrainer:
         rec = recall_score(self.y_test, y_pred)
         f1 = f1_score(self.y_test, y_pred)
         roc_auc = roc_auc_score(self.y_test, y_prob)
-        pr_auc = average_precision_score(self.y_test, y_prob) # Area Under Precision-Recall Curve
+        pr_auc = average_precision_score(self.y_test, y_prob)
 
         print(f"\n--- Test Set Results: {model_name} ---")
         print(f"Accuracy:  {acc:.4f}")
@@ -94,6 +158,24 @@ class ModelTrainer:
         # Visualizations
         self._plot_confusion_matrix(self.y_test, y_pred, model_name)
         self._plot_pr_curve(self.y_test, y_prob, model_name)
+
+    def save_model(self, model_name, directory='../models'):
+        """
+        Saves the trained model to a file using joblib.
+        Now includes cleaner filename generation.
+        """
+        if model_name not in self.models:
+            print(f"Error: {model_name} not found in trained models.")
+            return
+
+        os.makedirs(directory, exist_ok=True)
+        
+        # Clean filename: "Random Forest (CC)" -> "random_forest_cc.joblib"
+        clean_name = model_name.replace(" ", "_").replace("(", "").replace(")", "").lower()
+        filename = os.path.join(directory, f"{clean_name}.joblib")
+        
+        joblib.dump(self.models[model_name], filename)
+        print(f"Model saved to {filename}")
 
     def _plot_confusion_matrix(self, y_true, y_pred, title):
         cm = confusion_matrix(y_true, y_pred)
