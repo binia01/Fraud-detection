@@ -6,3 +6,5 @@ matplotlib
 seaborn
 shap
 xgboost
+pytest
+joblib
